@@ -237,7 +237,42 @@ def write_file_to_disk(fname, version, setbits, fbuf):
     fd.write("<bits>%s</bits>\n" % fdata)
     fd.close()
     os.rename(fname_tmp, fname)
+    rc = convert_to_zip(fname)
+    if rc != 0:
+        print "Error: Converting file to ZIP: %s" % (fname)
+        exit(-1)
+
+    rc = convert_to_base64(fname)
+    if rc != 0:
+        print "Error: Converting file to base64: %s" % (fname)
+        exit(-1)
+
     return True
+
+def convert_to_zip(fname):
+    try:
+        DEVNULL = open(os.devnull, "w")
+        rc = subprocess.call(["/usr/bin/zip", "%s.zip" % (fname), fname], stdout=DEVNULL)
+        DEVNULL.close()
+    except subprocess.CalledProcessError, e:
+        print "Error: Problem zipping file: %s" % (fname)
+        exit(-1)
+
+    if rc != 0:
+        return -1
+    return 0
+
+def convert_to_base64(fname):
+    try:
+        rc = subprocess.call(["/usr/local/bin/node", "./base64_converter.js", "%s.zip" % (fname)])
+    except subprocess.CalledProcessError, e:
+        print "Error: Problem converting to base64: %s" % (fname)
+        exit(-1)
+
+    if rc != 0:
+        return -1
+
+    return 0
 
 # Returns whether the array is modified or not
 def set_bit_in_array(fbuf, byte_number, bitpos_inside_byte):
