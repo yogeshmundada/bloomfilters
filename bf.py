@@ -68,6 +68,8 @@ BF_SUBDIR = "bloomfilters/"
 
 BLOOMFILTER_METADATA = "metadata.bloomfilter"
 
+DEFAULT_FNAME = BF_SUBDIR + "default"
+
 metadata = {}
 
 epoch_number = 10
@@ -226,6 +228,17 @@ def set_bit_positions(positions, resuming_from_partial_run):
                 is_version_updated[fname] = True
             write_file_to_disk(fname, version, setbits, fbuf)
     return existing_pwd, tot_new_bits, tot_new_files, tot_files_written_to
+
+
+# Construct a special file for those files that do not exist.
+# Whenever we do not find any file, we send this file.
+# This will contain no bits set and version is "0.0.0"
+def create_default_bloomfilter_file():
+    if not os.path.isfile(DEFAULT_FNAME):
+        fbuf = [0] * FILE_SIZE
+        version = "0.0.0"
+        setbits = 0
+        write_file_to_disk(DEFAULT_FNAME, version, setbits, fbuf)
 
 # Write the bloom filter to disk
 def write_file_to_disk(fname, version, setbits, fbuf):
@@ -475,6 +488,8 @@ def process_cracked_pwd_file(cracked_pwd_file):
     resume_cracked_pwd_file = get_resume_filename(cracked_pwd_file)
     metadata_this_pwd_db = None
 
+    create_default_bloomfilter_file()
+
     resuming_from_partial_run = False
     if os.path.isfile(resume_cracked_pwd_file):
         processed_info = process_resume_file(cracked_pwd_file)
@@ -574,6 +589,9 @@ def process_cracked_pwd_file(cracked_pwd_file):
 def delete_bloomfilters():
     if os.path.isfile(BLOOMFILTER_METADATA):
         os.remove(BLOOMFILTER_METADATA)
+
+    if os.path.isfile(DEFAULT_FNAME):
+        os.remove(DEFAULT_FNAME)
 
     try:
         rc = subprocess.check_output(["find", ".", "-name", "resume*"])    
