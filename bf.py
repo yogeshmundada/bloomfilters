@@ -38,6 +38,43 @@ from optparse import OptionParser
 import re
 import datetime
 import time
+import multiprocessing
+from Queue import Empty
+
+comm_mgr = multiprocessing.Manager()
+
+shared_bits_dict = comm_mgr.dict()
+number_bits_dict = comm_mgr.dict()
+# The following queue is such that a disk-writer 
+# process knows what keys are present in the shared
+# shared_bits_dict. This is so that you don't have
+# to run shared_bits_dict.keys() since this dict
+# will keep changing as writers will delete the keys
+# after flushing files to the disk.
+queued_files = multiprocessing.Queue()
+tot_files_to_flush = multiprocessing.Value('d', 0)
+# Following lock is a mutex for all above three shared
+# variables. If one wants to change any value in above 
+# three, first get the following lock.
+lk_bits_dict = multiprocessing.Lock()
+
+lk_dir_create = multiprocessing.Lock()
+
+# Default number of threads
+NUM_THREADS = 8
+
+pwdq = multiprocessing.Queue()
+ev_cont_read_pwd = multiprocessing.Event()
+ev_flush_bits = multiprocessing.Event()
+ev_terminate = multiprocessing.Event()
+ev_error = multiprocessing.Event()
+
+# Flush the bits in the bit_vector after number of
+# entries are greater than MAX_PWDS_TO_PROCESS_AT_A_TIME
+MAX_PWDS_TO_PROCESS_AT_A_TIME = 10000
+MAX_FILES_TO_FLUSH = MAX_PWDS_TO_PROCESS_AT_A_TIME * 5
+
+bit_vector = []
 
 # 50GB at the server
 BLOOMFILTER_SIZE = (2**30) * 50
@@ -94,6 +131,7 @@ bit_set_lookup = [
 # gets updated more than once. In such a case, we just want to change the
 # version string only once. This data-structure maintains that info.
 is_version_updated = {}
+lk_is_version_updated = multiprocessing.Lock()
 
 # Returns 10 hash values from 10 hash-functions
 # Check: http://www.eecs.harvard.edu/~kirsch/pubs/bbbf/rsa.pdf
@@ -230,6 +268,238 @@ def set_bit_positions(positions, resuming_from_partial_run):
     return existing_pwd, tot_new_bits, tot_new_files, tot_files_written_to
 
 
+### Using multiprocessing to speed-up -- START
+
+def set_multiple_bits_in_array(fbuf, bitpos_list):
+    tot_modified = 0
+    for p in range(len(bitpos_list)):
+        byte_number = int(math.ceil((bitpos_list[p] + 1.0)/ 8)) - 1
+        bitpos_inside_byte = bitpos_list[p] % 8
+        orig_byte = fbuf[byte_number]
+        fbuf[byte_number] = orig_byte | bit_set_lookup[bitpos_inside_byte]
+        if fbuf[byte_number] != orig_byte:
+            tot_modified += 1
+    return tot_modified
+
+def write_multiple_bits_to_file(dname, fname, bitpos_list):
+    with lk_dir_create:
+        if not os.path.isdir(dname):
+            os.makedirs(dname)
+
+    fbuf = None
+    version = None
+    setbits = None
+    if not os.path.isfile(fname):
+        fbuf = [0] * FILE_SIZE
+        version = "0.0.0"
+        setbits = 0
+    else:
+        fd = open(fname, "r")
+        fdata = fd.read()
+        lines = fdata.split("\n")
+        if "<version>" not in lines[0] or "</version>" not in lines[0]:
+            print "Error: Version information corrupt for: %s" % (fname)
+            ev_error.set()
+            exit(-1)
+        version = lines[0].split("<version>")[1].split("</version>")[0]
+
+        if "<setbits>" not in lines[1] or "</setbits>" not in lines[1]:
+            print "Error: Setbits information corrupt for: %s" % (fname)
+            ev_error.set()
+            exit(-1)
+        setbits = int(lines[1].split("<setbits>")[1].split("</setbits>")[0])
+
+        if "<bits>" not in lines[2] or "</bits>" not in lines[2]:
+            print "Error: Bit data not present for: %s" % (fname)
+            ev_error.set()
+            exit(-1)
+        bits = lines[2].split("<bits>")[1].split("</bits>")[0]
+        fbuf = list(struct.unpack("<%dB" % (FILE_SIZE), bits))
+
+    tot_modified = set_multiple_bits_in_array(fbuf, bitpos_list)
+
+    if tot_modified == 0:
+        # We probably set an already set bit. No change. 
+        # Do not write the file to the disk.
+        # if resuming_from_partial_run:
+        #     existing_pwd = False
+        #     tot_new_bits += 1
+        #     if fname in is_version_updated:
+        #         pass
+        #     else:
+        #         # update the version
+        #         tot_files_written_to += 1
+        #         version_triples_str = version.split(".")
+        #         version_triples = map(lambda x: int(x), version_triples_str)
+        #         version_triples[-1] += 1
+        #         version = "%d.%d.%d" % (version_triples[0], version_triples[1], version_triples[2])
+        #         is_version_updated[fname] = True
+        #         write_file_to_disk(fname, version, setbits, fbuf)
+        #         continue
+        pass
+    else:
+        # This means at the least one bit is different in this password.
+        # Thus we have not seen this password before
+        # existing_pwd = False
+        # tot_new_bits += 1
+
+        # Array is modified. Need to flush it to disk.
+        # Check whether we need to update the version string as well.
+        setbits += tot_modified
+
+        # Check if we need to increment version for this file or if
+        # has been already incremented
+        with lk_is_version_updated:
+            if fname in is_version_updated:
+                # Do nothing, just write the file back
+                pass
+            else:
+                # update the version
+                version_triples_str = version.split(".")
+                version_triples = map(lambda x: int(x), version_triples_str)
+                version_triples[-1] += 1
+                version = "%d.%d.%d" % (version_triples[0], version_triples[1], version_triples[2])
+                is_version_updated[fname] = True
+        write_file_to_disk(fname, version, setbits, fbuf)
+
+
+def flush_bits_to_disk(my_num, tot_files_to_flush):
+    print "flush_bits_to_disk(%d): Files pending to be flushed: %d" % (my_num, tot_files_to_flush.value)
+    while True:
+        rc = ev_flush_bits.wait(1)
+        if rc != True:
+            if queued_files.qsize() == 0:
+                if ev_terminate.is_set():
+                    print "flush_bits_to_disk(%d): Exiting as terminate is set" % (my_num) 
+                    exit(0)
+                if ev_error.is_set():
+                    print "flush_bits_to_disk(%d): Exiting as error is set" % (my_num) 
+                    exit(-1)
+            continue
+        if queued_files.qsize() == 0:
+            ev_flush_bits.clear()
+            continue
+        try:
+            # print "flush_bits_to_disk(%d): Trying to get file from queue, files to flush: %d, Qsize: %d" % \
+            #     (my_num, tot_files_to_flush.value, queued_files.qsize())
+            fname = queued_files.get(True, 1)
+            # print "flush_bits_to_disk(%d): Got the file, now going to get lock" % \
+            #     (my_num)
+            with lk_bits_dict:
+                dname = shared_bits_dict[fname]["dname"]
+                pwd_list = shared_bits_dict[fname]["pwd_list"]
+                bitpos_list = shared_bits_dict[fname]["bitpos_list"]
+                del shared_bits_dict[fname]
+                tot_files_to_flush.value -= 1
+                if tot_files_to_flush.value < MAX_FILES_TO_FLUSH:
+                    # print "##########################################"
+                    # print "flush_bits_to_disk(%d): Signalling to read more passwords, files_to_flush: %d" % \
+                    #     (my_num, tot_files_to_flush.value)
+                    ev_cont_read_pwd.set()
+
+            if len(pwd_list) == 0 or len(bitpos_list) == 0:
+                ev_error.set()
+                print "flush_bits_to_disk(%d): Terminating as no pwd_list or bitpos_list" % (my_num)
+                exit(-1)
+
+            # print "flush_bits_to_disk(%d): (files to flush: %d) Got a pending file: %s, pwd_list: %s, bitpos_list: %s" % \
+            #     (my_num, tot_files_to_flush.value, str(fname), str(pwd_list), str(bitpos_list))
+            write_multiple_bits_to_file(dname, fname, bitpos_list)
+        except Empty:
+            # print "flush_bits_to_disk(%d): No files found: %d" % (my_num, tot_files_to_flush.value)
+            continue
+        except Exception as e:
+            print "flush_bits_to_disk(%d): Exception occurred: %s" % (my_num, str(e))
+            ev_error.set()
+            print "flush_bits_to_disk(%d): Exiting due to error" % (my_num)
+            exit(-1)
+
+
+def calculate_hashes(my_num, tot_files_to_flush):
+    print "calculate_hashes(%d): Files pending to be flushed: %d" % (my_num, tot_files_to_flush.value)
+    while True:
+        try:
+            pw = pwdq.get(True, 1)
+            #print "calculate_hashes(%d): Got a password: %s" % (my_num, pw)
+            hashes = get_hashed_values(pw)
+            bit_positions = get_bit_positions(hashes)
+            with lk_bits_dict:
+                for p in bit_positions:
+                    dname = BF_SUBDIR + bit_positions[p]["dname"]
+                    fname = dname + "/" + bit_positions[p]["fname"]
+                    bitpos = bit_positions[p]["bitpos"]
+                    if fname not in shared_bits_dict:
+                        nd = comm_mgr.dict()
+                        pwd_list = comm_mgr.list()
+                        bitpos_list = comm_mgr.list()
+                        nd["dname"] = dname
+                        nd["pwd_list"] = pwd_list
+                        nd["bitpos_list"] = bitpos_list
+                        shared_bits_dict[fname] = nd
+                        queued_files.put(fname)
+                        tot_files_to_flush.value += 1
+                        if tot_files_to_flush.value > MAX_FILES_TO_FLUSH:
+                            ev_flush_bits.set()
+                        # print "calculate_hashes(%d): Adding new file to file queue: %s" % \
+                        #     (my_num, fname)
+
+                    nd = shared_bits_dict[fname]
+                    pwd_list = nd["pwd_list"]
+                    bitpos_list = nd["bitpos_list"]
+
+                    pwd_list.append(pw)
+                    bitpos_list.append(bitpos)
+
+                    nd["pwd_list"] = pwd_list
+                    nd["bitpos_list"] = bitpos_list
+                    shared_bits_dict[fname] = nd
+                    # print "Here here: Pwd_list value: %s, %s" % (pw, str(shared_bits_dict[fname]['pwd_list']))
+                    # print "Here here: Bitpos_list value: %s, %s" % (pw, str(shared_bits_dict[fname]['bitpos_list']))
+                    # print "calculate_hashes(%d): Calculated bits(passwd=%s, fname=%s), Dict entry: %s" % \
+                    #     (my_num, pw, fname, str(shared_bits_dict[fname]))
+        except Empty:
+            if ev_terminate.is_set():
+                print "calculate_hashes(%d): Exiting as terminate is set" % (my_num) 
+                ev_flush_bits.set()
+                exit(0)
+            if ev_error.is_set():
+                print "calculate_hashes(%d): Exiting as error is set" % (my_num) 
+                ev_flush_bits.set()
+                exit(-1)
+            continue
+        except Exception as e:
+            print "calculate_hashes(%d): Exception occurred: %s" % (my_num, str(e))
+            ev_error.set()
+            print "calculate_hashes(%d): Exiting due to error" % (my_num)
+            exit(-1)
+
+
+def read_pwds(cracked_pwd_file):
+    tot_read_pwds = 0
+    with open(cracked_pwd_file, "r") as cpf:
+        for line in cpf:
+            if line[-1] == '\n':
+                line = line[:-1]
+            pwd = line.rstrip()    
+            pwdq.put(pwd)
+            tot_read_pwds += 1
+            # print "read_pwds(): Read %d passwords, Total files to flush: %d" % \
+            #     (tot_read_pwds, tot_files_to_flush.value)
+
+            if tot_files_to_flush.value > MAX_FILES_TO_FLUSH or \
+                    tot_read_pwds > (MAX_FILES_TO_FLUSH):
+                print "read_pwds(): Read %d passwords, Total files to flush: %d, going to sleep" % \
+                    (tot_read_pwds, tot_files_to_flush.value)
+                ev_cont_read_pwd.wait()
+                print "$$$$$$$$$$$$$$ Signal to read more pwds"
+                tot_read_pwds = 0
+                ev_cont_read_pwd.clear()
+    print "Read all passwords, setting terminate: %d" % (tot_read_pwds)
+    ev_terminate.set()
+    return
+
+### Using multiprocessing to speed-up -- END
+
 # Construct a special file for those files that do not exist.
 # Whenever we do not find any file, we send this file.
 # This will contain no bits set and version is "0.0.0"
@@ -262,6 +532,7 @@ def write_file_to_disk(fname, version, setbits, fbuf):
 
     return True
 
+
 def convert_to_zip(fname):
     try:
         DEVNULL = open(os.devnull, "w")
@@ -275,6 +546,7 @@ def convert_to_zip(fname):
         return -1
     return 0
 
+
 def convert_to_base64(fname):
     try:
         rc = subprocess.call(["/usr/local/bin/node", "./base64_converter.js", "%s.zip" % (fname)])
@@ -287,6 +559,7 @@ def convert_to_base64(fname):
 
     return 0
 
+
 # Returns whether the array is modified or not
 def set_bit_in_array(fbuf, byte_number, bitpos_inside_byte):
     orig_byte = fbuf[byte_number]
@@ -295,11 +568,13 @@ def set_bit_in_array(fbuf, byte_number, bitpos_inside_byte):
         return False
     return True
 
+
 def get_resume_filename(cracked_pwd_file):
     fields = cracked_pwd_file.split("/")
     fields[-1] = "resume." + fields[-1]
     fname = "/".join(fields)
     return fname
+
 
 # Process json file
 def process_resume_file(cracked_pwd_file, extra_check=True):
@@ -329,6 +604,7 @@ def process_resume_file(cracked_pwd_file, extra_check=True):
         exit(-1)
     return pi
 
+
 def create_resume_file(cracked_pwd_file, processed_info):
     processed_info["name"] = cracked_pwd_file
     try:
@@ -349,12 +625,14 @@ def create_resume_file(cracked_pwd_file, processed_info):
 
     return
 
+
 # Dump the json structure
 def update_resume_file(cracked_pwd_file, processed_info):
     fname = get_resume_filename(cracked_pwd_file)
     with open(fname, "w+") as rcpf:
         json.dump(processed_info, rcpf)
     return
+
 
 # Runs over all bloom filter files and checks if <setbits> matches
 # with actual number of bits set.
@@ -592,6 +870,10 @@ def delete_bloomfilters():
 
     if os.path.isfile(DEFAULT_FNAME):
         os.remove(DEFAULT_FNAME)
+    if os.path.isfile(DEFAULT_FNAME + ".zip"):
+        os.remove(DEFAULT_FNAME + ".zip")
+    if os.path.isfile(DEFAULT_FNAME + ".base64"):
+        os.remove(DEFAULT_FNAME + ".base64")
 
     try:
         rc = subprocess.check_output(["find", ".", "-name", "resume*"])    
@@ -694,6 +976,15 @@ if __name__ == '__main__':
     parser.add_option("-r", "--cross-check",
                       action="store_true", dest="crosscheck", default=False,
                       help="Runs over all bloomfilter files and cross-checks meta-info with actual info")
+    parser.add_option("-p", "--parallelize",
+                      action="store_true", dest="parallelize", default=False,
+                      help="Parallelize bloomfilter generation across cores")
+    parser.add_option("-s", "--max-bit-vector",
+                      action="store", type="int", dest="maxbitvector", default=10000,
+                      help="Max entries to cache. After this, flush them all to the disk")
+    parser.add_option("-t", "--num-threads",
+                      action="store", type="int", dest="numthreads", default=8,
+                      help="Number of threads to run to get the work done")
     parser.add_option("-a", "--add-cracked-db",
                       action="store", type="string", dest="cracked_pwd_file", default="",
                       help="""Process this cracked password file and add to bloom filter""")
@@ -712,6 +1003,13 @@ if __name__ == '__main__':
 
     (options, args) = parser.parse_args()
 
+    if options.maxbitvector:
+        MAX_PWDS_TO_PROCESS_AT_A_TIME = options.maxbitvector
+        MAX_FILES_TO_FLUSH = MAX_PWDS_TO_PROCESS_AT_A_TIME * 5
+
+    if options.numthreads:
+        NUM_THREADS = options.numthreads
+
     if options.clean_up:
         print_meta_information()
         print "You have asked to delete all the bloom filter files. This will delete all the above information\n\n"
@@ -727,8 +1025,34 @@ if __name__ == '__main__':
         print_meta_information()
         exit(0)
     elif options.cracked_pwd_file != "":
-        process_cracked_pwd_file(options.cracked_pwd_file)
-        exit(0)
+        #pdb.set_trace()
+        if not options.parallelize:
+            process_cracked_pwd_file(options.cracked_pwd_file)
+            exit(0)
+        else:
+            print "Parallelizing with %d processes" % (NUM_THREADS)
+            print "Bit flush will happen after processing %d files" % (MAX_FILES_TO_FLUSH)
+
+            all_processes = []
+            p = multiprocessing.Process(target=read_pwds, args=([options.cracked_pwd_file]))
+            p.start()
+            all_processes.append(p)
+            
+            for i in range(NUM_THREADS):
+                p = multiprocessing.Process(target=calculate_hashes, args=([i, tot_files_to_flush]))
+                p.start()
+                all_processes.append(p)
+
+            for i in range(NUM_THREADS):
+                p = multiprocessing.Process(target=flush_bits_to_disk, args=([i, tot_files_to_flush]))
+                p.start()
+                all_processes.append(p)
+                
+            print "Here here: Waiting for join"
+            for i in range(len(all_processes)):
+                all_processes[i].join()
+            print "Here here: Done join"
+
     elif options.checkfile != "":
         checkfile(options.checkfile)
         exit(0)
@@ -737,3 +1061,5 @@ if __name__ == '__main__':
     else:
         print "Unrecognized option"
         parser.print_help()
+
+    print "Here here: OOOOOOOOOOOOOOOOOOOOOOOO Exiting"
