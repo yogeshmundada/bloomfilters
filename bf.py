@@ -82,6 +82,10 @@ BLOOMFILTER_SIZE = (2**30) * 50
 # Total bloomfilter bits in those 50GB
 TOTAL_BITS = (BLOOMFILTER_SIZE * 8) 
 
+
+ERR_FILE_LOCK = comm_mgr.Lock()
+ERR_FILE = "errors.txt"
+
 # File size in bytes (10K)
 FILE_SIZE = (2**10) * 10
 
@@ -281,7 +285,7 @@ def set_multiple_bits_in_array(fbuf, bitpos_list):
             tot_modified += 1
     return tot_modified
 
-def write_multiple_bits_to_file(dname, fname, bitpos_list):
+def write_multiple_bits_to_file(dname, fname, bitpos_list, pwd_list):
     with lk_dir_create:
         if not os.path.isdir(dname):
             os.makedirs(dname)
@@ -299,18 +303,33 @@ def write_multiple_bits_to_file(dname, fname, bitpos_list):
         lines = fdata.split("\n")
         if "<version>" not in lines[0] or "</version>" not in lines[0]:
             print "Error: Version information corrupt for: %s" % (fname)
+            with ERR_FILE_LOCK:
+                efd = open(ERR_FILE, "a")
+                efd.write("Error: Version information corrupt for: %s, pwd_list: %s, bitpos_list: %s\n" % \
+                              (fname, str(pwd_list), str(bitpos_list)))
+                efd.close()
             ev_error.set()
             exit(-1)
         version = lines[0].split("<version>")[1].split("</version>")[0]
 
         if "<setbits>" not in lines[1] or "</setbits>" not in lines[1]:
             print "Error: Setbits information corrupt for: %s" % (fname)
+            with ERR_FILE_LOCK:
+                efd = open(ERR_FILE, "a")
+                efd.write("Error: Setbits information corrupt for: %s, pwd_list: %s, bitpos_list: %s\n" % \
+                              (fname, str(pwd_list), str(bitpos_list)))
+                efd.close()
             ev_error.set()
             exit(-1)
         setbits = int(lines[1].split("<setbits>")[1].split("</setbits>")[0])
 
         if "<bits>" not in lines[2] or "</bits>" not in lines[2]:
             print "Error: Bit data not present for: %s" % (fname)
+            with ERR_FILE_LOCK:
+                efd = open(ERR_FILE, "a")
+                efd.write("Error: Bit data not present for: %s, pwd_list: %s, bitpos_list: %s\n" % \
+                              (fname, str(pwd_list), str(bitpos_list)))
+                efd.close()
             ev_error.set()
             exit(-1)
         bits = lines[2].split("<bits>")[1].split("</bits>")[0]
@@ -364,20 +383,22 @@ def write_multiple_bits_to_file(dname, fname, bitpos_list):
 
 
 def flush_bits_to_disk(my_num, tot_files_to_flush):
-    print "flush_bits_to_disk(%d): Files pending to be flushed: %d" % (my_num, tot_files_to_flush.value)
+    FILE_LOCKS = {}
+    pool = multiprocessing.Pool(processes=50)
     while True:
         rc = ev_flush_bits.wait(1)
         if rc != True:
             if queued_files.qsize() == 0:
                 if ev_terminate.is_set():
                     print "flush_bits_to_disk(%d): Exiting as terminate is set" % (my_num) 
+                    pool.close()
+                    pool.join()
                     exit(0)
                 if ev_error.is_set():
                     print "flush_bits_to_disk(%d): Exiting as error is set" % (my_num) 
+                    pool.close()
+                    pool.join()
                     exit(-1)
-            continue
-        if queued_files.qsize() == 0:
-            ev_flush_bits.clear()
             continue
         try:
             # print "flush_bits_to_disk(%d): Trying to get file from queue, files to flush: %d, Qsize: %d" % \
@@ -390,11 +411,11 @@ def flush_bits_to_disk(my_num, tot_files_to_flush):
                 pwd_list = shared_bits_dict[fname]["pwd_list"]
                 bitpos_list = shared_bits_dict[fname]["bitpos_list"]
                 del shared_bits_dict[fname]
+                if fname not in FILE_LOCKS:
+                    FILE_LOCKS[fname] = comm_mgr.Lock()
                 tot_files_to_flush.value -= 1
-                if tot_files_to_flush.value < MAX_FILES_TO_FLUSH:
-                    # print "##########################################"
-                    # print "flush_bits_to_disk(%d): Signalling to read more passwords, files_to_flush: %d" % \
-                    #     (my_num, tot_files_to_flush.value)
+                if tot_files_to_flush.value == 0:
+                    ev_flush_bits.clear()
                     ev_cont_read_pwd.set()
 
             if len(pwd_list) == 0 or len(bitpos_list) == 0:
@@ -402,9 +423,15 @@ def flush_bits_to_disk(my_num, tot_files_to_flush):
                 print "flush_bits_to_disk(%d): Terminating as no pwd_list or bitpos_list" % (my_num)
                 exit(-1)
 
-            # print "flush_bits_to_disk(%d): (files to flush: %d) Got a pending file: %s, pwd_list: %s, bitpos_list: %s" % \
-            #     (my_num, tot_files_to_flush.value, str(fname), str(pwd_list), str(bitpos_list))
-            write_multiple_bits_to_file(dname, fname, bitpos_list)
+            if len(bitpos_list) > 1:
+                print "flush_bits_to_disk(%d): (files to flush: %d) Got a pending file: %s, pwd_list: %s, bitpos_list: %s" % \
+                    (my_num, tot_files_to_flush.value, str(fname), str(pwd_list), str(bitpos_list))
+
+            with FILE_LOCKS[fname]:
+                pool.apply_async(write_multiple_bits_to_file, (dname, fname, bitpos_list, pwd_list))
+                #p = multiprocessing.Process(target=write_multiple_bits_to_file, args=([dname, fname, bitpos_list, pwd_list]))
+                #p.start()
+            # write_multiple_bits_to_file(dname, fname, bitpos_list)
         except Empty:
             # print "flush_bits_to_disk(%d): No files found: %d" % (my_num, tot_files_to_flush.value)
             continue
@@ -414,9 +441,7 @@ def flush_bits_to_disk(my_num, tot_files_to_flush):
             print "flush_bits_to_disk(%d): Exiting due to error" % (my_num)
             exit(-1)
 
-
 def calculate_hashes(my_num, tot_files_to_flush):
-    print "calculate_hashes(%d): Files pending to be flushed: %d" % (my_num, tot_files_to_flush.value)
     while True:
         try:
             pw = pwdq.get(True, 1)
@@ -442,7 +467,7 @@ def calculate_hashes(my_num, tot_files_to_flush):
                             ev_flush_bits.set()
                         # print "calculate_hashes(%d): Adding new file to file queue: %s" % \
                         #     (my_num, fname)
-
+                    
                     nd = shared_bits_dict[fname]
                     pwd_list = nd["pwd_list"]
                     bitpos_list = nd["bitpos_list"]
@@ -466,6 +491,7 @@ def calculate_hashes(my_num, tot_files_to_flush):
                 print "calculate_hashes(%d): Exiting as error is set" % (my_num) 
                 ev_flush_bits.set()
                 exit(-1)
+            print "calculate_hashes(%d): Nothing read from the Queue" % (my_num)
             continue
         except Exception as e:
             print "calculate_hashes(%d): Exception occurred: %s" % (my_num, str(e))
@@ -476,18 +502,21 @@ def calculate_hashes(my_num, tot_files_to_flush):
 
 def read_pwds(cracked_pwd_file):
     tot_read_pwds = 0
+    all_pwds = {}
     with open(cracked_pwd_file, "r") as cpf:
         for line in cpf:
             if line[-1] == '\n':
                 line = line[:-1]
             pwd = line.rstrip()    
-            pwdq.put(pwd)
-            tot_read_pwds += 1
+            if pwd not in all_pwds:
+                all_pwds[pwd] = True
+                pwdq.put(pwd)
+                tot_read_pwds += 1
             # print "read_pwds(): Read %d passwords, Total files to flush: %d" % \
             #     (tot_read_pwds, tot_files_to_flush.value)
 
             if tot_files_to_flush.value > MAX_FILES_TO_FLUSH or \
-                    tot_read_pwds > (MAX_FILES_TO_FLUSH):
+                    (tot_read_pwds * 10) > (MAX_FILES_TO_FLUSH):
                 print "read_pwds(): Read %d passwords, Total files to flush: %d, going to sleep" % \
                     (tot_read_pwds, tot_files_to_flush.value)
                 ev_cont_read_pwd.wait()
@@ -1043,15 +1072,14 @@ if __name__ == '__main__':
                 p.start()
                 all_processes.append(p)
 
-            for i in range(NUM_THREADS):
-                p = multiprocessing.Process(target=flush_bits_to_disk, args=([i, tot_files_to_flush]))
-                p.start()
-                all_processes.append(p)
+            p = multiprocessing.Process(target=flush_bits_to_disk, args=([i, tot_files_to_flush]))
+            p.start()
+            all_processes.append(p)
                 
-            print "Here here: Waiting for join"
+            print "Main Thread: Waiting for join"
             for i in range(len(all_processes)):
                 all_processes[i].join()
-            print "Here here: Done join"
+            print "Main Thread: All children terminated...exiting"
 
     elif options.checkfile != "":
         checkfile(options.checkfile)
@@ -1062,4 +1090,4 @@ if __name__ == '__main__':
         print "Unrecognized option"
         parser.print_help()
 
-    print "Here here: OOOOOOOOOOOOOOOOOOOOOOOO Exiting"
+
