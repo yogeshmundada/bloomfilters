@@ -528,7 +528,6 @@ def read_pwds(cracked_pwd_file):
     return
 
 ### Using multiprocessing to speed-up -- END
-
 # Construct a special file for those files that do not exist.
 # Whenever we do not find any file, we send this file.
 # This will contain no bits set and version is "0.0.0"
@@ -560,7 +559,6 @@ def write_file_to_disk(fname, version, setbits, fbuf):
         exit(-1)
 
     return True
-
 
 def convert_to_zip(fname):
     try:
@@ -741,6 +739,23 @@ def cross_check_bloom_filters():
     return
 
 
+def checkdir(dirname):
+    for i in range(TOT_DIR):
+        start_file = i * FILES_PER_DIR
+        end_file = i * FILES_PER_DIR + FILES_PER_DIR
+        for j in range(start_file, end_file):
+            dname = dirname + "/" + str(i)
+            fname = dname + "/" + str(j)
+
+            if not os.path.isdir(dname):
+                break
+            
+            if not os.path.isfile(fname):
+                continue
+
+            checkfile(fname)
+    return
+
 def checkfile(fname):
     fd = open(fname, "r")
     fdata = fd.read()
@@ -765,11 +780,12 @@ def checkfile(fname):
     fbuf = list(struct.unpack("<%dB" % (FILE_SIZE), bits))
                 
     tot_bits = 0
+    print "Filename: %s" % (fname)
     for k in xrange(len(fbuf)):
         byte = fbuf[k]
         for m in range(8):
             if (byte & bit_set_lookup[m]) != 0:
-                print "Bit %d is set in byte %d" % (m, k)
+                print "\tBit %d is set in byte %d" % (m, k)
                 tot_bits += 1
 
     return
@@ -1020,6 +1036,9 @@ if __name__ == '__main__':
     parser.add_option("-c", "--check-file",
                       action="store", type="string", dest="checkfile", default="",
                       help="""Check file and tell which bits are set""")
+    parser.add_option("", "--check-dir",
+                      action="store", type="string", dest="checkdir", default="",
+                      help="Check all files in a given directory and tell which bits are set for each file")
     parser.add_option("-m", "--meta-info",
                       action="store_true", dest="metainfo", default=False,
                       help="""Spew meta information such as:
@@ -1083,6 +1102,9 @@ if __name__ == '__main__':
 
     elif options.checkfile != "":
         checkfile(options.checkfile)
+        exit(0)
+    elif options.checkdir != "":
+        checkdir(options.checkdir)
         exit(0)
     elif options.crosscheck:
         cross_check_bloom_filters()
