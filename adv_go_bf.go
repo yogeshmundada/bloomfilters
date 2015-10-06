@@ -4,7 +4,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"strings"
 	"bytes"
 	"math"
 	"strconv"
@@ -16,6 +15,7 @@ import (
 	"math/big"
 	"os/exec"
 	"bufio"
+	"sort"
 )
 
 // Expected false positives for bloomfilter 50GB long,
@@ -33,14 +33,14 @@ var (
 	BLOOMFILTER_SIZE = uint64(math.Pow(2, 30) * 50)
 	// Total bloomfilter bits in those 50GB
 	TOTAL_BITS = (BLOOMFILTER_SIZE * 8) 
-	// File size in bytes (10KB)
-	FILE_SIZE = uint64(math.Pow(2, 10) * 10)
+	// File size in bytes (100MB)
+	FILE_SIZE = uint64(math.Pow(2, 20) * 100)
 	// Bloomfilter bits in each file
 	BITS_PER_FILE = FILE_SIZE * 8
 	// Total files in each directory.
-	FILES_PER_DIR = 1000
+	FILES_PER_DIR = 32
 	// Total directories
-	TOT_DIR = 5242
+	TOT_DIR = 16
 	BF_SUBDIR = "bloomfilters/"
 	BLOOMFILTER_METADATA = "metadata.bloomfilter"
 	DEFAULT_FNAME = BF_SUBDIR + "default"
@@ -99,7 +99,7 @@ func read_bf_file(fn string) (
 
 	fd, err := os.Open(fn)
 	if err != nil {
-		fmt.Println("APPU ERROR: Cannot open file: %v", fn);
+		fmt.Printf("APPU ERROR: Cannot open file: %v\n", fn);
 		rc = -1
 		return
 	}
@@ -107,7 +107,7 @@ func read_bf_file(fn string) (
 	
 	stat, err := fd.Stat()	
 	if err != nil {
-		fmt.Println("APPU ERROR: Cannot stat file: %v", fn);
+		fmt.Printf("APPU ERROR: Cannot stat file: %v\n", fn);
 		rc = -1
 		return
 	}
@@ -143,56 +143,6 @@ func convert_to_base64(fname string) (retcode int) {
 	if err := exec.Command("/usr/local/bin/node", "./base64_converter.js", fname + ".zip").Run(); err != nil {
 		retcode = -1
 	}
-	return
-}
-
-func create_dir(dname string) (retcode int) {
-	dir_exists, _ := exists(dname)
-	if dir_exists {
-		return
-	}
-	
-	if err := os.Mkdir(dname, os.ModeDir | os.ModePerm); err != nil {
-		retcode = -1
-	}
-	return 
-}
-
-
-func write_bf_file(fname string,
-	version string,
-	setbits int,
-	bitsbuf []byte) (retcode int) {
-
-	retcode = 0
-
-	fd, err := os.Create(fname)
-	if err != nil {
-		fmt.Printf("APPU ERROR: Cannot create file: %v (%v)\n", fname, err);
-		retcode = -1
-		return
-	}
-	
-	fbuf := []byte{}
-	fbuf = append(fbuf, []byte("<version>" + version + "</version>\n")...)
-	fbuf = append(fbuf, []byte("<setbits>" + strconv.Itoa(setbits) + "</setbits>\n")...)
-	fbuf = append(fbuf, []byte("<bits>")...)
-	fbuf = append(fbuf, bitsbuf...)
-	fbuf = append(fbuf, []byte("</bits>\n")...)
-
-	if _, err = fd.Write(fbuf); err != nil {
-		retcode = -1
-	}
-
-	fd.Close()
-	
-	// if rc := convert_to_zip(fname); rc != 0 {
-	// 	retcode = -1
-	// }
-	// if rc := convert_to_base64(fname); rc != 0 {
-	// 	retcode = -1
-	// }
-	
 	return
 }
 
@@ -425,30 +375,84 @@ func get_bit_positions(hashes []string) (hl hash_location) {
 }
 
 
-// Returns whether the array is modified or not
-func set_bit_in_array(fbuf []byte, byte_number int, bitpos_inside_byte int) (bool) {
-	orig_byte := fbuf[byte_number]
-	fbuf[byte_number] = (orig_byte | bit_set_lookup[bitpos_inside_byte])
-	if fbuf[byte_number] == orig_byte {
-		return false
+func open_bf_file(fn string) (fd *os.File, retcode int) {
+	var err error
+	fd, err = os.OpenFile(fn, os.O_RDWR | os.O_SYNC, 644)
+	if err != nil {
+		fmt.Printf("APPU ERROR: Cannot open file: %v\n", fn);
+		retcode = -1
+		return
 	}
-    return true
+
+	return
+}
+
+
+func set_bit_in_byte(b []byte, bit int) (retcode bool, t []byte){
+	t = make([]byte, 1)
+	t[0] = (b[0] | bit_set_lookup[bit])
+	if t[0] == b[0] {
+		return false, t
+	}
+	return true, t
+}
+
+func read_one_byte_from_file(fn string, fd *os.File, byte_position int64) (b []byte, retcode int) {
+	// Offset 52 bytes
+	b = make([]byte, 1)
+	_, err := fd.ReadAt(b, (byte_position + 52))
+	if err != nil {
+		fmt.Println("APPU ERROR: Cannot read one byte from file: %v(position: %v)", fn, byte_position);
+		retcode = -1
+		return
+	}
+
+	return b, 0
+}
+
+
+func write_one_byte_to_file(fn string, fd *os.File, byte_position int64, b []byte) (retcode int) {
+	// Offset 52 bytes
+	_, err := fd.WriteAt(b, (byte_position + 52))
+	if err != nil {
+		fmt.Println("APPU ERROR: Cannot write one byte from file: %v(position: %v)", fn, byte_position);
+		retcode = -1
+		return
+	}
+
+	return
 }
 
 // In this map, key is filename
 var lk_bit_positions sync.RWMutex
+
+type BITPOS []uint64
+
+
+func (s BITPOS) Len() int {
+	return len(s)
+}
+
+func (s BITPOS) Swap(i, j int) {
+	s[i], s[j] = s[j], s[i]
+}
+
+func (s BITPOS) Less(i, j int) bool {
+	return s[i] < s[j]
+}
+
 type map_bit_position_value struct{
 	sync.Mutex
 	fname string
 	dname string
-	bitpos_array []uint64
+	bitpos_array BITPOS
 }
 
 type bit_position map[string] *map_bit_position_value
 
 var map_bit_position bit_position
 
-var FLUSH_TO_FILE_THRESHOLD = 10000
+var FLUSH_TO_FILE_THRESHOLD = 1000000
 //var FLUSH_TO_FILE_THRESHOLD = 2
 
 func accumulate_bitpositions(wg *sync.WaitGroup, location_chan <-chan hash_location, signal_pwd_reader chan<- bool) {
@@ -503,17 +507,17 @@ func flush_to_files() {
 	subwg.Add(num_bitposition_to_file_workers)
 
 	for i := 0; i < num_bitposition_to_file_workers; i++ {
-		go func(c <-chan *map_bit_position_value) {
+		go func(c <-chan *map_bit_position_value, worker_num int) {
 
 			for bpv := range(c) {
 				fmt.Printf("DELETE ME: BEFORE flush_bit_position_values(): %v\n", bpv)
-				flush_bit_position_values(bpv)
+				flush_bit_position_values(bpv, worker_num)
 				fmt.Printf("DELETE ME: AFTER flush_bit_position_values()\n")
 			}
 
 			//fmt.Printf("DELETE ME: Closing goroutine that called flush_bit_position_values()\n")
 			subwg.Done()
-		}(bit_position_value_chan[i])
+		}(bit_position_value_chan[i], i)
 	}
 
 	
@@ -537,7 +541,7 @@ func flush_to_files() {
 	//fmt.Printf("DELETE ME: DONE WAITING FOR goroutines of flush_to_files()\n")
 }
 
-func flush_bit_position_values(bpv *map_bit_position_value) (
+func flush_bit_position_values(bpv *map_bit_position_value, worker_num int) (
 	retcode int) {
 	bpv.Lock()
 	defer bpv.Unlock()
@@ -549,197 +553,36 @@ func flush_bit_position_values(bpv *map_bit_position_value) (
 
 	fmt.Println("DELETE ME: Read HASH LOCATION")
 	
-	create_dir(dname)
-
-	var fbuf []byte
-	var bitsbuf []byte
-	var version string
-	var setbits int
 	var rc int
-	var bitbuf_start int
-	var bitbuf_end int
-	var is_file_changed = false
+	var fd *os.File
 
-	if file_exists, _ := exists(fname); !file_exists {
-		bitsbuf = make([]byte, FILE_SIZE)
-		version = "0.0.0"
-		setbits = 0
-	} else {
-		rc, version, setbits, bitbuf_start, bitbuf_end, fbuf = read_bf_file(fname) 
-		fmt.Printf("DELETE ME: Read file, file: %v, bitbuf_start: %v, bitbuf_end: %v\n", fname, bitbuf_start, bitbuf_end)
-		bitsbuf = fbuf[bitbuf_start : bitbuf_end]
-		if rc != 0 {
-			retcode = -1
-			fmt.Printf("APPU ERROR: read_bf_file() returned -1")
-			return
-		}
+	fd, rc = open_bf_file(fname)
+	if rc != 0 {
+		return
 	}
+	defer fd.Close()
+
+	sort.Sort(bpv.bitpos_array)
 
 	for _, bp := range bpv.bitpos_array {
-		byte_number := int(math.Ceil(float64(bp + 1.0)/ 8)) - 1
+		byte_number := int64(math.Ceil(float64(bp + 1.0)/ 8)) - 1
 		bitpos_inside_byte := int(bp % 8)
 		
-		fmt.Printf("DELETE ME: SET POS, file: %v, bitpos: %v\n", fname, bp)
+		fmt.Printf("DELETE ME: (Worker Num: %v) SET POS, file: %v, bitpos: %v\n", worker_num, fname, bp)
 		
-		if rc := set_bit_in_array(bitsbuf, byte_number, bitpos_inside_byte); !rc {
-			// There was no change to the file
+		if b, rc := read_one_byte_from_file(fname, fd, byte_number); rc != 0 {
+			fmt.Printf("APPU ERROR: Could not read byte")
 		} else {
-			// File was modified
-			is_file_changed = true
-			setbits += 1
+			if rc, modified_b := set_bit_in_byte(b, bitpos_inside_byte); rc == true {
+				if rc := write_one_byte_to_file(fname, fd, byte_number, modified_b); rc != 0 {
+					return
+				}
+			}
 		}
-	}
-
-	if is_file_changed {
-		version_str_array := strings.Split(version, ".")
-		new_version, _ := strconv.Atoi(version_str_array[2])
-		new_version++
-		version = version_str_array[0] + "." + version_str_array[1] + "." + strconv.Itoa(new_version)
-
-		write_bf_file(fname, version, setbits, bitsbuf)
 	}
 
 	return
 }
-
-
-func bitposition_to_file(wg *sync.WaitGroup, location_chan <-chan hash_location) {
-	defer wg.Done()
-
-	// for hl := range(location_chan) {
-	// 	set_bit_positions_in_file(hl)
-	// }
-
-	var commu_chan []chan hash_location
-
-	for i := 0; i < num_bitposition_to_file_workers; i++ {
-		commu_chan = append(commu_chan, make(chan hash_location))
-	}
-
-	var subwg sync.WaitGroup
-	subwg.Add(num_bitposition_to_file_workers)
-
-	for i := 0; i < num_bitposition_to_file_workers; i++ {
-		go func(c <-chan hash_location) {
-			for hl := range(c) {
-				fmt.Printf("DELETE ME: BEFORE set_bit_positions(): %v\n", hl)
-				set_bit_positions_in_file(hl)
-				fmt.Printf("DELETE ME: AFTER set_bit_positions()\n")
-			}
-
-			//fmt.Printf("DELETE ME: Closing goroutine that called set_bit_positions_in_file()\n")
-			subwg.Done()
-		}(commu_chan[i])
-	}
-
-
-	for hl := range(location_chan) {
-		for _, v := range(hl) {
-			num_gr := int(math.Mod(float64(v.bitpos), float64(num_bitposition_to_file_workers)))
-			commu_chan[num_gr] <- hl
-		}
-	}
-
-	for i := 0; i < num_bitposition_to_file_workers; i++ {
-		close(commu_chan[i])
-	}
-
-	//fmt.Printf("DELETE ME: waiting for all goroutines of set_bit_positions_in_file() to be done\n")
-	subwg.Wait()
-	//fmt.Printf("DELETE ME: DONE WAITING FOR goroutines of set_bit_positions_in_file()\n")
-}
-
-
-func set_bit_positions_in_file(hl hash_location) (
-	retcode int,
-	existing_pwd bool,
-	tot_new_bits int,
-	tot_new_files int,
-	tot_files_written_to int) {
-
-	retcode = 0
-	existing_pwd = true
-	tot_new_bits = 0
-	tot_new_files = 0
-	tot_files_written_to = 0
-
-	for _, v := range(hl) {
-		fmt.Println("DELETE ME: Read HASH LOCATION")
-		dname := BF_SUBDIR + v.dname
-		fname := dname + "/" + v.fname
-		bitpos := v.bitpos
-
-		var file_lock *sync.Mutex;
-
-		fname_lock.Lock()
-
-		if val_lock, ok := per_file_lock[fname]; ok {
-		   file_lock = val_lock
-		} else {
-		   file_lock = new(sync.Mutex)
-		   per_file_lock[fname] = file_lock
-		}		
-
-		fname_lock.Unlock()
-
-		file_lock.Lock()
-		defer file_lock.Unlock()	
-
-		create_dir(dname)
-
-		var fbuf []byte
-		var bitsbuf []byte
-		var version string
-		var setbits int
-		var rc int
-		var bitbuf_start int
-		var bitbuf_end int
-
-		if file_exists, _ := exists(fname); !file_exists {
-			bitsbuf = make([]byte, FILE_SIZE)
-			version = "0.0.0"
-			setbits = 0
-			tot_new_files += 1
-		} else {
-			rc, version, setbits, bitbuf_start, bitbuf_end, fbuf = read_bf_file(fname) 
-			fmt.Printf("DELETE ME: Read file, file: %v, bitbuf_start: %v, bitbuf_end: %v\n", fname, bitbuf_start, bitbuf_end)
-			bitsbuf = fbuf[bitbuf_start : bitbuf_end]
-			if rc != 0 {
-				retcode = -1
-				fmt.Printf("APPU ERROR: read_bf_file() returned -1")
-				return
-			}
-		}
-
-		byte_number := int(math.Ceil(float64(bitpos + 1.0)/ 8)) - 1
-		bitpos_inside_byte := int(bitpos % 8)
-		
-		fmt.Printf("DELETE ME: SET POS, file: %v, bitpos: %v\n", fname, bitpos)
-
-		if rc := set_bit_in_array(bitsbuf, byte_number, bitpos_inside_byte); !rc {
-			// There was no change to the file
-		} else {
-			// File was modified
-			existing_pwd = false
-			tot_new_bits += 1
-			setbits += 1
-			if _, ok := is_version_updated[fname]; ok {
-				// File version already updated
-			} else {
-				// Update the file version
-				tot_files_written_to++
-				version_str_array := strings.Split(version, ".")
-				new_version, _ := strconv.Atoi(version_str_array[2])
-				new_version++
-				version = version_str_array[0] + "." + version_str_array[1] + "." + strconv.Itoa(new_version)
-				is_version_updated[fname] = true
-			}
-			write_bf_file(fname, version, setbits, bitsbuf)
-		}
-	}
-	return
-}
-
 
 func process_pwd_file(wg *sync.WaitGroup, 
 	pwd_file string, 
@@ -814,31 +657,10 @@ func main() {
 	wg.Add(1)
 	go hash_to_location(&wg, hash_chan, location_chan)
 
-	//wg.Add(1)
-	//go bitposition_to_file(&wg, location_chan)
-
 	wg.Add(1)
 	go accumulate_bitpositions(&wg, location_chan, signal_pwd_reader)
-
 
 	fmt.Printf("DELETE ME: waiting for all goroutines of main() to be done\n")
 	wg.Wait()
 	fmt.Printf("DELETE ME: DONE WAITING FOR goroutines of main()\n")
-
-	////
-
-	//check_bits_in_files([]string{os.Args[1]})
-
-	// hashes := get_hashed_values("password")
-	// hl := get_bit_positions(hashes)
-
-	// for h, s := range(hl) {
-	// 	fmt.Println("Hash: %v\n", h)
-	// 	fmt.Println("\tDname: %v\n", s.dname)
-	// 	fmt.Println("\tFname: %v\n", s.fname)
-	// 	fmt.Println("\tBitpos: %v\n", s.bitpos)
-	// }
-
-	// fmt.Println("Total number of CPUs: %v, GOMAXPROCS: %v\n", runtime.NumCPU(), runtime.GOMAXPROCS(0))
-
 }
